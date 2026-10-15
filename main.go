@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -53,12 +54,14 @@ const (
 	maxRedirects      = 10
 	defaultFileMode   = 0o644
 	defaultFolderMode = 0o755
+	downloadCapacity  = 10
 )
 
 var (
 	filesetIDPattern   = regexp.MustCompile(`\\?"fileset_id\\?"\s*:\s*\\?"([0-9a-fA-F-]{36})\\?"`)
 	pastedSharePattern = regexp.MustCompile(`(?i)(?:https?://)?qfile\.qq\.com/q/[a-z0-9_-]+`)
 	volumePartPattern  = regexp.MustCompile(`(?i)^(.*)\.(\d{3,})$`)
+	fileCommitMu       sync.Mutex
 )
 
 type output struct {
@@ -307,22 +310,8 @@ func main() {
 func runInteractive(timeout time.Duration) error {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("QQ 闪传下载器")
-	fmt.Print("请粘贴 QQ 闪传链接，然后按 Enter：")
-	rawURL, err := reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("读取链接: %w", err)
-	}
-	if strings.TrimSpace(rawURL) == "" {
-		return nil
-	}
-	shareURL, err := normalizePastedShareURL(rawURL)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("正在解析分享链接…")
-	share, err := parseShare(context.Background(), shareURL, timeout)
-	if err != nil {
+	share, err := promptForShare(context.Background(), reader, os.Stdout, timeout, parseShare)
+	if err != nil || share == nil {
 		return err
 	}
 	available := 0
@@ -336,7 +325,8 @@ func runInteractive(timeout time.Duration) error {
 		fmt.Printf("有 %d 个文件被 QQ 限制或不可用，下载时会跳过并显示原因。\n", len(share.Files)-available)
 	}
 
-	continueFlow, err := waitForEnter(reader, "按 Enter 开始逐个下载文件：")
+	fmt.Println("按文件大小自动调节并发：≤20 MB 最多 10 个，≤200 MB 最多 5 个，≤1 GB 最多 2 个，更大或大小未知时单独下载。")
+	continueFlow, err := waitForEnter(reader, "按 Enter 开始下载文件：")
 	if err != nil || !continueFlow {
 		return err
 	}
@@ -375,6 +365,38 @@ func runInteractive(timeout time.Duration) error {
 
 	_, err = waitForEnter(reader, "哈希已展示。按 Enter 退出：")
 	return err
+}
+
+func promptForShare(ctx context.Context, reader *bufio.Reader, writer io.Writer, timeout time.Duration,
+	parse func(context.Context, string, time.Duration) (*parsedShare, error),
+) (*parsedShare, error) {
+	for {
+		fmt.Fprint(writer, "请粘贴 QQ 闪传链接，然后按 Enter（直接按 Enter 退出）：")
+		rawURL, readErr := reader.ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, fmt.Errorf("读取链接: %w", readErr)
+		}
+		if strings.TrimSpace(rawURL) == "" {
+			return nil, nil
+		}
+		shareURL, err := normalizePastedShareURL(rawURL)
+		if err == nil {
+			fmt.Fprintln(writer, "正在解析分享链接…")
+			var share *parsedShare
+			share, err = parse(ctx, shareURL, timeout)
+			if err == nil {
+				return share, nil
+			}
+		}
+		fmt.Fprintf(writer, "链接解析失败：%v\n", err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil, nil
+		}
+		fmt.Fprintln(writer, "请检查链接或网络后重新输入。")
+	}
 }
 
 func waitForEnter(reader *bufio.Reader, prompt string) (bool, error) {
@@ -701,46 +723,102 @@ func (c *qfileClient) resolveDownloads(ctx context.Context, physicalIDs []string
 }
 
 func downloadAll(ctx context.Context, share *parsedShare, root string) ([]string, int) {
-	downloaded := make([]string, 0, len(share.Files))
+	type downloadResult struct {
+		index  int
+		weight int
+		path   string
+		size   int64
+		err    error
+	}
+	results := make(chan downloadResult, downloadCapacity)
+	savedPaths := make([]string, len(share.Files))
 	failures := 0
-	for index, file := range share.Files {
-		label := printablePath(file.Path)
-		if file.Error != "" {
-			failures++
-			fmt.Printf("[%d/%d] 跳过 %s：%s\n", index+1, len(share.Files), label, file.Error)
+	next, active, used := 0, 0, 0
+	for next < len(share.Files) || active > 0 {
+		for next < len(share.Files) {
+			file := share.Files[next]
+			reason := file.Error
+			if ctx.Err() != nil {
+				reason = ctx.Err().Error()
+			}
+			if reason != "" {
+				failures++
+				fmt.Printf("[%d/%d] 跳过 %s：%s\n", next+1, len(share.Files), printablePath(file.Path), reason)
+				next++
+				continue
+			}
+			weight := downloadWeight(file.Size)
+			if used+weight > downloadCapacity {
+				break
+			}
+			index := next
+			next++
+			active++
+			used += weight
+			fmt.Printf("[%d/%d] 下载 %s（当前 %d 个任务）\n", index+1, len(share.Files), printablePath(file.Path), active)
+			go func() {
+				path, size, err := downloadShareFile(ctx, share.Client, file, root)
+				results <- downloadResult{index: index, weight: weight, path: path, size: size, err: err}
+			}()
+		}
+		if active == 0 {
 			continue
 		}
-
-		fmt.Printf("[%d/%d] 下载 %s\n", index+1, len(share.Files), label)
-		destination, err := localDownloadPath(root, file.Path)
-		if err != nil {
+		result := <-results
+		active--
+		used -= result.weight
+		if result.err != nil {
 			failures++
-			fmt.Printf("  失败：不能创建安全的本地文件名：%v\n", err)
+			fmt.Printf("[%d/%d] 失败 %s：%v\n", result.index+1, len(share.Files), printablePath(share.Files[result.index].Path), result.err)
 			continue
 		}
-		directURLs := share.Client.resolveDownloads(ctx, []string{file.PhysicalID})
-		direct, ok := directURLs[file.PhysicalID]
-		if !ok {
-			failures++
-			fmt.Println("  失败：QQ 未返回下载地址。")
-			continue
+		savedPaths[result.index] = result.path
+		fmt.Printf("[%d/%d] 已保存：%s（%d 字节）\n", result.index+1, len(share.Files), result.path, result.size)
+	}
+	// Preserve share order for archive processing, irrespective of completion order.
+	downloaded := make([]string, 0, len(savedPaths))
+	for _, path := range savedPaths {
+		if path != "" {
+			downloaded = append(downloaded, path)
 		}
-		if direct.Error != "" {
-			failures++
-			fmt.Printf("  失败：%s\n", direct.Error)
-			continue
-		}
-
-		savedPath, size, err := share.Client.downloadFile(ctx, withFilename(direct.URL, file.Name), destination)
-		if err != nil {
-			failures++
-			fmt.Printf("  失败：%v\n", err)
-			continue
-		}
-		downloaded = append(downloaded, savedPath)
-		fmt.Printf("  已保存：%s（%d 字节）\n", savedPath, size)
 	}
 	return downloaded, failures
+}
+
+// All active tasks share ten slots: small/medium/large/unknown files use
+// one/two/five/ten slots each, so mixed sizes cannot exceed the same budget.
+func downloadWeight(rawSize string) int {
+	size, err := strconv.ParseInt(strings.TrimSpace(rawSize), 10, 64)
+	if err != nil || size < 0 {
+		return downloadCapacity
+	}
+	switch {
+	case size <= 20<<20:
+		return 1
+	case size <= 200<<20:
+		return 2
+	case size <= 1<<30:
+		return 5
+	default:
+		return downloadCapacity
+	}
+}
+
+func downloadShareFile(ctx context.Context, client *qfileClient, file shareFile, root string) (string, int64, error) {
+	destination, err := localDownloadPath(root, file.Path)
+	if err != nil {
+		return "", 0, fmt.Errorf("不能创建安全的本地文件名: %w", err)
+	}
+	// Resolve immediately before downloading to avoid expiring queued URLs.
+	directURLs := client.resolveDownloads(ctx, []string{file.PhysicalID})
+	direct, ok := directURLs[file.PhysicalID]
+	if !ok {
+		return "", 0, errors.New("QQ 未返回下载地址")
+	}
+	if direct.Error != "" {
+		return "", 0, errors.New(direct.Error)
+	}
+	return client.downloadFile(ctx, withFilename(direct.URL, file.Name), destination)
 }
 
 func (c *qfileClient) downloadFile(ctx context.Context, directURL, destination string) (string, int64, error) {
@@ -822,10 +900,6 @@ func isWindowsReservedName(name string) bool {
 }
 
 func writeNewFile(destination string, source io.Reader, mode os.FileMode) (string, int64, error) {
-	destination, err := chooseAvailablePath(destination)
-	if err != nil {
-		return "", 0, err
-	}
 	if err := os.MkdirAll(filepath.Dir(destination), defaultFolderMode); err != nil {
 		return "", 0, err
 	}
@@ -850,6 +924,13 @@ func writeNewFile(destination string, source io.Reader, mode os.FileMode) (strin
 		return "", 0, err
 	}
 	if err := temporary.Close(); err != nil {
+		return "", 0, err
+	}
+	// Only filename selection and commit are serialized; streaming stays concurrent.
+	fileCommitMu.Lock()
+	defer fileCommitMu.Unlock()
+	destination, err = chooseAvailablePath(destination)
+	if err != nil {
 		return "", 0, err
 	}
 	if err := os.Rename(temporary.Name(), destination); err != nil {
