@@ -862,6 +862,9 @@ func localDownloadPath(root, remotePath string) (string, error) {
 	if !pathWithin(root, destination) {
 		return "", errors.New("file path would leave the current directory")
 	}
+	if err := rejectSymlinkComponents(root, destination); err != nil {
+		return "", err
+	}
 	return destination, nil
 }
 
@@ -1097,6 +1100,9 @@ func archiveKindFor(path string) archiveKind {
 }
 
 func extractVolumeGroup(group volumeGroup, root string) ([]string, error) {
+	if err := validateVolumeSequence(group); err != nil {
+		return nil, err
+	}
 	readers, closers, err := openVolumeReaders(group.parts)
 	if err != nil {
 		return nil, err
@@ -1155,6 +1161,34 @@ func extractVolumeGroup(group volumeGroup, root string) ([]string, error) {
 	default:
 		return nil, errors.New("unsupported archive format")
 	}
+}
+
+func validateVolumeSequence(group volumeGroup) error {
+	if len(group.parts) <= 1 {
+		return nil
+	}
+	start := 0
+	expected := int64(1)
+	if group.parts[0] == group.basePath {
+		// An unnumbered base file is the first volume, so its successors start at 2.
+		start = 1
+		expected = 2
+	}
+	for _, path := range group.parts[start:] {
+		match := volumePartPattern.FindStringSubmatch(filepath.Base(path))
+		if len(match) != 3 {
+			return fmt.Errorf("invalid volume name %q", path)
+		}
+		number, err := strconv.ParseInt(match[2], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid volume number in %q: %w", path, err)
+		}
+		if number != expected {
+			return fmt.Errorf("invalid volume sequence for %q: got volume %d, expected %d", group.basePath, number, expected)
+		}
+		expected++
+	}
+	return nil
 }
 
 func zstdSuffix(path string) string {
@@ -1327,7 +1361,51 @@ func safeArchivePath(destinationDir, root, archiveName string) (string, error) {
 	if !pathWithin(destinationDir, target) || !pathWithin(root, target) {
 		return "", errors.New("path escapes extraction directory")
 	}
+	if err := rejectSymlinkComponents(root, target); err != nil {
+		return "", err
+	}
 	return target, nil
+}
+
+// Lexical containment checks do not account for existing links in the output
+// tree. Reject every link component before creating directories or files.
+func rejectSymlinkComponents(root, target string) error {
+	if !pathWithin(root, target) {
+		return errors.New("path escapes output directory")
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve output directory: %w", err)
+	}
+	absoluteTarget, err := filepath.Abs(target)
+	if err != nil {
+		return fmt.Errorf("resolve output path: %w", err)
+	}
+	relative, err := filepath.Rel(absoluteRoot, absoluteTarget)
+	if err != nil {
+		return fmt.Errorf("inspect output path: %w", err)
+	}
+	current := absoluteRoot
+	components := []string{"."}
+	if relative != "." {
+		components = strings.Split(relative, string(os.PathSeparator))
+	}
+	for _, component := range components {
+		if component != "." {
+			current = filepath.Join(current, component)
+		}
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect output path %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("output path contains symbolic link %q", current)
+		}
+	}
+	return nil
 }
 
 func pathWithin(base, target string) bool {

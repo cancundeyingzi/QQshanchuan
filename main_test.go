@@ -5,10 +5,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -172,6 +175,79 @@ func TestSafeLocalAndArchivePathsStayWithinRoot(t *testing.T) {
 	}
 }
 
+func TestArchiveExtractionRejectsSymlinkedDirectory(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	makeDirectoryLink(t, outside, filepath.Join(root, "linked"))
+	archivePath := filepath.Join(root, "bundle.tar")
+	if err := os.WriteFile(archivePath, makeTar(t, map[string]string{"linked/escaped.txt": "must stay inside"}), defaultFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	report := processVolumeArchives([]string{archivePath}, root)
+	if report.completed != 0 || report.failures != 1 || len(report.files) != 0 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "escaped.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("archive wrote through directory symlink: %v", err)
+	}
+}
+
+func TestLocalDownloadPathRejectsSymlinkedDirectory(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	makeDirectoryLink(t, outside, filepath.Join(root, "linked"))
+	if _, err := localDownloadPath(root, "linked/escaped.txt"); err == nil {
+		t.Fatal("download path through a directory symlink was accepted")
+	}
+}
+
+func TestVolumeSequenceValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		parts   []string
+		wantErr bool
+	}{
+		{name: "base plus second volume", parts: []string{"bundle.tar", "bundle.tar.002"}},
+		{name: "numbered volumes", parts: []string{"bundle.tar.001", "bundle.tar.002", "bundle.tar.003"}},
+		{name: "gap after base", parts: []string{"bundle.tar", "bundle.tar.003"}, wantErr: true},
+		{name: "gap in numbered volumes", parts: []string{"bundle.tar.001", "bundle.tar.003"}, wantErr: true},
+		{name: "numbered volumes must start at one", parts: []string{"bundle.tar.002", "bundle.tar.003"}, wantErr: true},
+		{name: "base successor must start at two", parts: []string{"bundle.tar", "bundle.tar.001"}, wantErr: true},
+		{name: "duplicate numeric volume", parts: []string{"bundle.tar.001", "bundle.tar.0001", "bundle.tar.002"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			group := volumeGroup{basePath: "bundle.tar", parts: test.parts, kind: archiveTar}
+			err := validateVolumeSequence(group)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateVolumeSequence() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestMissingVolumeDoesNotExtractPartialArchive(t *testing.T) {
+	root := t.TempDir()
+	tarData := makeTar(t, map[string]string{"inside.txt": "content"})
+	firstPart := filepath.Join(root, "bundle.tar.001")
+	thirdPart := filepath.Join(root, "bundle.tar.003")
+	if err := os.WriteFile(firstPart, tarData[:len(tarData)/2], defaultFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(thirdPart, tarData[len(tarData)/2:], defaultFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	report := processVolumeArchives([]string{firstPart, thirdPart}, root)
+	if report.completed != 0 || report.failures != 1 || report.extracted != 0 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+	if _, err := os.Stat(filepath.Join(root, "inside.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial archive was extracted: %v", err)
+	}
+}
+
 func TestDownloadFileUsesMetadataDestination(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Disposition", `attachment; filename="wrong-name.bin"`)
@@ -306,5 +382,20 @@ func assertFileContents(t *testing.T, path, want string) {
 	}
 	if got := string(data); got != want {
 		t.Fatalf("contents of %q = %q, want %q", path, got, want)
+	}
+}
+
+func makeDirectoryLink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err == nil {
+		return
+	} else if runtime.GOOS != "windows" {
+		t.Skipf("symbolic links are unavailable: %v", err)
+	}
+	// Directory junctions do not require Windows' symbolic-link privilege and
+	// exercise the same unsafe path traversal on standard development machines.
+	output, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
+	if err != nil {
+		t.Skipf("directory links are unavailable: %v: %s", err, output)
 	}
 }
