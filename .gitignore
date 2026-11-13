@@ -9,3 +9,7 @@
 
 # 本地 IDE 配置
 /.idea/
+
+# 仅在本地保留的测试源码和构建脚本
+*_test.go
+/buildall.cmd
