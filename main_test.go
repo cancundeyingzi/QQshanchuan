@@ -260,7 +260,7 @@ func TestDownloadFileUsesMetadataDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(t.TempDir(), "正确文件名.txt")
-	savedPath, size, err := client.downloadFile(context.Background(), server.URL, destination)
+	savedPath, size, err := client.downloadFile(context.Background(), server.URL, destination, int64(len("downloaded bytes")))
 	if err != nil {
 		t.Fatal(err)
 	}

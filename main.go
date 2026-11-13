@@ -3,7 +3,6 @@
 package main
 
 import (
-	"archive/tar"
 	"bufio"
 	"compress/gzip"
 	"context"
@@ -23,6 +22,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -46,15 +46,16 @@ const (
 	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
 		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-	listPageSize      = 100
-	downloadBatch     = 30
-	maxPageBytes      = 8 << 20
-	maxRPCBytes       = 8 << 20
-	copyBufferSize    = 256 << 10
-	maxRedirects      = 10
-	defaultFileMode   = 0o644
-	defaultFolderMode = 0o755
-	downloadCapacity  = 10
+	listPageSize               = 100
+	downloadBatch              = 30
+	maxPageBytes               = 8 << 20
+	maxRPCBytes                = 8 << 20
+	copyBufferSize             = 256 << 10
+	maxRedirects               = 10
+	defaultFileMode            = 0o644
+	defaultFolderMode          = 0o755
+	downloadCapacity           = 10
+	defaultDownloadIdleTimeout = 2 * time.Minute
 )
 
 var (
@@ -96,10 +97,11 @@ type shareFile struct {
 }
 
 type qfileClient struct {
-	httpClient     *http.Client
-	downloadClient *http.Client
-	deviceID       string
-	shareURL       string
+	httpClient          *http.Client
+	downloadClient      *http.Client
+	downloadIdleTimeout time.Duration
+	deviceID            string
+	shareURL            string
 }
 
 type folderTask struct {
@@ -244,85 +246,101 @@ type fileHashValues struct {
 }
 
 func main() {
-	var (
-		asText  bool
-		outPath string
-		timeout time.Duration
-	)
+	os.Exit(runCLI(context.Background(), os.Args[1:], os.Stdout, os.Stderr, extract))
+}
 
-	flag.BoolVar(&asText, "text", false, "print tab-separated path and direct URL instead of JSON")
-	flag.StringVar(&outPath, "output", "", "write direct-URL output to this file instead of stdout")
-	flag.DurationVar(&timeout, "timeout", 45*time.Second, "timeout for each QQ API request")
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n  %s                              # interactive downloader\n  %s [options] <https://qfile.qq.com/q/SHARE_CODE>\n\n", os.Args[0], os.Args[0])
-		flag.PrintDefaults()
+func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
+	extractLinks func(context.Context, string, time.Duration) (output, error),
+) int {
+	var (
+		asText      bool
+		outPath     string
+		timeout     time.Duration
+		idleTimeout time.Duration
+	)
+	flags := flag.NewFlagSet("qfile-link", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.BoolVar(&asText, "text", false, "输出经过转义的两列文本（文件路径、直链），默认输出 JSON")
+	flags.StringVar(&outPath, "output", "", "将直链信息写入此文件，默认写入标准输出")
+	flags.DurationVar(&timeout, "timeout", 45*time.Second, "每次 QQ API 请求及下载响应头等待的超时")
+	flags.DurationVar(&idleTimeout, "download-idle-timeout", defaultDownloadIdleTimeout, "下载响应体连续没有字节进展的超时")
+	flags.Usage = func() {
+		fmt.Fprint(stderr, "用法：\n  qfile-link                              # 交互式下载\n  qfile-link [选项] <https://qfile.qq.com/q/SHARE_CODE>\n\n")
+		flags.PrintDefaults()
 	}
-	flag.Parse()
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if timeout <= 0 || idleTimeout <= 0 {
+		fmt.Fprintln(stderr, "错误：-timeout 和 -download-idle-timeout 必须大于 0。")
+		return 2
+	}
+	fail := func(err error) int {
+		fmt.Fprintf(stderr, "错误：%s\n", terminalText(err.Error()))
+		return 1
+	}
 
 	// Launching the executable without arguments is the normal end-user flow.
-	if flag.NArg() == 0 && !asText && outPath == "" {
-		if err := runInteractive(timeout); err != nil {
-			fmt.Fprintln(os.Stderr, "错误:", err)
-			os.Exit(1)
+	if flags.NArg() == 0 && !asText && outPath == "" {
+		if err := runInteractive(ctx, timeout, idleTimeout); err != nil {
+			return fail(err)
 		}
-		return
+		return 0
 	}
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
 	}
 
 	// Keep the original direct-URL extraction mode for scripts and integrations.
-	ctx, cancel := context.WithTimeout(context.Background(), timeout*200)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, timeout*200)
 	defer cancel()
-	result, err := extract(ctx, flag.Arg(0), timeout)
+	result, err := extractLinks(ctx, flags.Arg(0), timeout)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
+		return fail(err)
 	}
 
-	var writer io.Writer = os.Stdout
+	writer := stdout
 	var closer io.Closer
 	if outPath != "" {
 		file, createErr := os.Create(outPath)
 		if createErr != nil {
-			fmt.Fprintln(os.Stderr, "Error creating output file:", createErr)
-			os.Exit(1)
+			return fail(fmt.Errorf("创建输出文件: %w", createErr))
 		}
 		writer, closer = file, file
 	}
-	if closer != nil {
-		defer closer.Close()
+	if err := writeOutput(writer, closer, result, asText); err != nil {
+		return fail(err)
 	}
-
-	if asText {
-		writeText(writer, result)
-		return
-	}
-	encoder := json.NewEncoder(writer)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(result); err != nil {
-		fmt.Fprintln(os.Stderr, "Error writing output:", err)
-		os.Exit(1)
-	}
+	return 0
 }
 
-func runInteractive(timeout time.Duration) error {
+func runInteractive(ctx context.Context, timeout, idleTimeout time.Duration) error {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("QQ 闪传下载器")
-	share, err := promptForShare(context.Background(), reader, os.Stdout, timeout, parseShare)
+	share, err := promptForShare(ctx, reader, os.Stdout, timeout, func(ctx context.Context, raw string, timeout time.Duration) (*parsedShare, error) {
+		requestCtx, stop := signal.NotifyContext(ctx, os.Interrupt)
+		defer stop()
+		return parseShare(requestCtx, raw, timeout)
+	})
 	if err != nil || share == nil {
 		return err
 	}
+	share.Client.downloadIdleTimeout = idleTimeout
 	available := 0
 	for _, file := range share.Files {
 		if file.Error == "" {
 			available++
 		}
 	}
-	fmt.Printf("解析完成：共 %d 个文件，其中 %d 个可下载。\n", len(share.Files), available)
+	logf("解析完成：共 %d 个文件，其中 %d 个可下载。\n", len(share.Files), available)
 	if available < len(share.Files) {
-		fmt.Printf("有 %d 个文件被 QQ 限制或不可用，下载时会跳过并显示原因。\n", len(share.Files)-available)
+		logf("有 %d 个文件被 QQ 限制或不可用，下载时会跳过并显示原因。\n", len(share.Files)-available)
 	}
 
 	fmt.Println("按文件大小自动调节并发：≤20 MB 最多 10 个，≤200 MB 最多 5 个，≤1 GB 最多 2 个，更大或大小未知时单独下载。")
@@ -339,11 +357,17 @@ func runInteractive(timeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("解析当前运行目录: %w", err)
 	}
-	downloaded, failures := downloadAll(context.Background(), share, root)
+	downloadCtx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	downloaded, failures := downloadAll(downloadCtx, share, root)
+	downloadErr := downloadCtx.Err()
+	stop()
+	if downloadErr != nil {
+		return downloadErr
+	}
 	if failures == 0 {
-		fmt.Printf("下载完成：成功保存 %d 个文件到 %s。\n", len(downloaded), root)
+		logf("下载完成：成功保存 %d 个文件到 %s。\n", len(downloaded), root)
 	} else {
-		fmt.Printf("下载阶段完成：成功 %d 个，失败或跳过 %d 个；文件保存在 %s。\n", len(downloaded), failures, root)
+		logf("下载阶段完成：成功 %d 个，失败或跳过 %d 个；文件保存在 %s。\n", len(downloaded), failures, root)
 	}
 
 	continueFlow, err = waitForEnter(reader, "按 Enter 检查已下载的 tar/gz/xz/zstd 压缩包及分卷并自动解压：")
@@ -354,9 +378,9 @@ func runInteractive(timeout time.Duration) error {
 	if report.found == 0 {
 		fmt.Println("未发现可处理的 tar/gz/xz/zstd 压缩包或分卷。")
 	} else if report.failures == 0 {
-		fmt.Printf("压缩包处理完成：已处理 %d 组，解压得到 %d 个文件。原始压缩包和分卷已保留。\n", report.completed, report.extracted)
+		logf("压缩包处理完成：已处理 %d 组，解压得到 %d 个文件。原始压缩包和分卷已保留。\n", report.completed, report.extracted)
 	} else {
-		fmt.Printf("压缩包处理完成：成功 %d/%d 组，解压得到 %d 个文件，失败 %d 组。原始压缩包和分卷已保留。\n", report.completed, report.found, report.extracted, report.failures)
+		logf("压缩包处理完成：成功 %d/%d 组，解压得到 %d 个文件，失败 %d 组。原始压缩包和分卷已保留。\n", report.completed, report.found, report.extracted, report.failures)
 	}
 
 	hashPaths := append([]string{}, downloaded...)
@@ -388,9 +412,12 @@ func promptForShare(ctx context.Context, reader *bufio.Reader, writer io.Writer,
 				return share, nil
 			}
 		}
-		fmt.Fprintf(writer, "链接解析失败：%v\n", err)
+		fmt.Fprintf(writer, "链接解析失败：%s\n", terminalText(err.Error()))
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if errors.Is(err, context.Canceled) {
+			return nil, err
 		}
 		if errors.Is(readErr, io.EOF) {
 			return nil, nil
@@ -493,6 +520,9 @@ func parseShare(ctx context.Context, rawShareURL string, timeout time.Duration) 
 }
 
 func newQFileClient(timeout time.Duration, shareURL string) (*qfileClient, error) {
+	if timeout <= 0 {
+		return nil, errors.New("request timeout must be positive")
+	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, fmt.Errorf("create cookie jar: %w", err)
@@ -507,11 +537,15 @@ func newQFileClient(timeout time.Duration, shareURL string) (*qfileClient, error
 			return nil
 		},
 	}
+	downloadTransport := http.DefaultTransport.(*http.Transport).Clone()
+	downloadTransport.ResponseHeaderTimeout = timeout
+	downloadTransport.DisableCompression = true
 	downloadClient := &http.Client{
 		// A file transfer can be large, so it intentionally has no whole-download
 		// deadline. Reuse QQ's cookie jar because some download nodes require the
 		// device cookie obtained from the share page. Redirects remain HTTP(S).
-		Jar: jar,
+		Jar:       jar,
+		Transport: downloadTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
 				return fmt.Errorf("too many download redirects")
@@ -522,7 +556,8 @@ func newQFileClient(timeout time.Duration, shareURL string) (*qfileClient, error
 			return nil
 		},
 	}
-	return &qfileClient{httpClient: apiClient, downloadClient: downloadClient, shareURL: shareURL}, nil
+	return &qfileClient{httpClient: apiClient, downloadClient: downloadClient,
+		downloadIdleTimeout: defaultDownloadIdleTimeout, shareURL: shareURL}, nil
 }
 
 func validateShareURL(raw string) (string, error) {
@@ -723,6 +758,12 @@ func (c *qfileClient) resolveDownloads(ctx context.Context, physicalIDs []string
 }
 
 func downloadAll(ctx context.Context, share *parsedShare, root string) ([]string, int) {
+	return downloadAllWith(ctx, share, root, downloadShareFile)
+}
+
+type shareDownloader func(context.Context, *qfileClient, shareFile, string) (string, int64, error)
+
+func downloadAllWith(ctx context.Context, share *parsedShare, root string, download shareDownloader) ([]string, int) {
 	type downloadResult struct {
 		index  int
 		weight int
@@ -743,7 +784,7 @@ func downloadAll(ctx context.Context, share *parsedShare, root string) ([]string
 			}
 			if reason != "" {
 				failures++
-				fmt.Printf("[%d/%d] 跳过 %s：%s\n", next+1, len(share.Files), printablePath(file.Path), reason)
+				logf("[%d/%d] 跳过 %s：%s\n", next+1, len(share.Files), printablePath(file.Path), reason)
 				next++
 				continue
 			}
@@ -755,9 +796,13 @@ func downloadAll(ctx context.Context, share *parsedShare, root string) ([]string
 			next++
 			active++
 			used += weight
-			fmt.Printf("[%d/%d] 下载 %s（当前 %d 个任务）\n", index+1, len(share.Files), printablePath(file.Path), active)
+			sizeNote := ""
+			if parsedFileSize(file.Size) < 0 {
+				sizeNote = "；大小未知，未进行长度核对"
+			}
+			logf("[%d/%d] 下载 %s（当前 %d 个任务%s）\n", index+1, len(share.Files), printablePath(file.Path), active, sizeNote)
 			go func() {
-				path, size, err := downloadShareFile(ctx, share.Client, file, root)
+				path, size, err := download(ctx, share.Client, file, root)
 				results <- downloadResult{index: index, weight: weight, path: path, size: size, err: err}
 			}()
 		}
@@ -769,11 +814,11 @@ func downloadAll(ctx context.Context, share *parsedShare, root string) ([]string
 		used -= result.weight
 		if result.err != nil {
 			failures++
-			fmt.Printf("[%d/%d] 失败 %s：%v\n", result.index+1, len(share.Files), printablePath(share.Files[result.index].Path), result.err)
+			logf("[%d/%d] 失败 %s：%v\n", result.index+1, len(share.Files), printablePath(share.Files[result.index].Path), result.err)
 			continue
 		}
 		savedPaths[result.index] = result.path
-		fmt.Printf("[%d/%d] 已保存：%s（%d 字节）\n", result.index+1, len(share.Files), result.path, result.size)
+		logf("[%d/%d] 已保存：%s（%d 字节）\n", result.index+1, len(share.Files), result.path, result.size)
 	}
 	// Preserve share order for archive processing, irrespective of completion order.
 	downloaded := make([]string, 0, len(savedPaths))
@@ -788,8 +833,8 @@ func downloadAll(ctx context.Context, share *parsedShare, root string) ([]string
 // All active tasks share ten slots: small/medium/large/unknown files use
 // one/two/five/ten slots each, so mixed sizes cannot exceed the same budget.
 func downloadWeight(rawSize string) int {
-	size, err := strconv.ParseInt(strings.TrimSpace(rawSize), 10, 64)
-	if err != nil || size < 0 {
+	size := parsedFileSize(rawSize)
+	if size < 0 {
 		return downloadCapacity
 	}
 	switch {
@@ -802,6 +847,14 @@ func downloadWeight(rawSize string) int {
 	default:
 		return downloadCapacity
 	}
+}
+
+func parsedFileSize(raw string) int64 {
+	size, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || size < 0 {
+		return -1
+	}
+	return size
 }
 
 func downloadShareFile(ctx context.Context, client *qfileClient, file shareFile, root string) (string, int64, error) {
@@ -818,10 +871,12 @@ func downloadShareFile(ctx context.Context, client *qfileClient, file shareFile,
 	if direct.Error != "" {
 		return "", 0, errors.New(direct.Error)
 	}
-	return client.downloadFile(ctx, withFilename(direct.URL, file.Name), destination)
+	return client.downloadFile(ctx, withFilename(direct.URL, file.Name), destination, parsedFileSize(file.Size))
 }
 
-func (c *qfileClient) downloadFile(ctx context.Context, directURL, destination string) (string, int64, error) {
+func (c *qfileClient) downloadFile(ctx context.Context, directURL, destination string, expectedSize int64) (string, int64, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, directURL, nil)
 	if err != nil {
 		return "", 0, fmt.Errorf("create download request: %w", err)
@@ -833,15 +888,39 @@ func (c *qfileClient) downloadFile(ctx context.Context, directURL, destination s
 		return "", 0, fmt.Errorf("download request: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		body, readErr := readLimited(resp.Body, maxPageBytes)
+	body := newDownloadProgressReader(resp.Body, c.downloadIdleTimeout, cancel)
+	defer body.stop()
+	if resp.StatusCode != http.StatusOK {
+		data, readErr := readLimited(body, maxPageBytes)
 		if readErr != nil {
-			return "", 0, fmt.Errorf("download returned %s", resp.Status)
+			if cause := context.Cause(ctx); cause != nil {
+				readErr = cause
+			}
+			return "", 0, fmt.Errorf("download returned %s: %w", resp.Status, readErr)
 		}
-		return "", 0, fmt.Errorf("download returned %s: %s", resp.Status, compact(body, 400))
+		return "", 0, fmt.Errorf("download returned %s: %s", resp.Status, compact(data, 400))
 	}
-	savedPath, size, err := writeNewFile(destination, resp.Body, defaultFileMode)
+	if expectedSize >= 0 && resp.ContentLength >= 0 && resp.ContentLength != expectedSize {
+		return "", 0, fmt.Errorf("download size mismatch: expected %d bytes, HTTP declares %d", expectedSize, resp.ContentLength)
+	}
+	var source io.Reader = body
+	if expectedSize >= 0 && expectedSize < 1<<63-1 {
+		// One extra byte detects an oversized response without streaming it all.
+		source = io.LimitReader(body, expectedSize+1)
+	}
+	savedPath, size, err := writeNewFileValidated(destination, source, defaultFileMode, func(size int64) error {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		if expectedSize >= 0 && size != expectedSize {
+			return fmt.Errorf("download size mismatch: expected %d bytes, received %d", expectedSize, size)
+		}
+		return nil
+	})
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
 		return "", 0, fmt.Errorf("save download: %w", err)
 	}
 	return savedPath, size, nil
@@ -903,6 +982,10 @@ func isWindowsReservedName(name string) bool {
 }
 
 func writeNewFile(destination string, source io.Reader, mode os.FileMode) (string, int64, error) {
+	return writeNewFileValidated(destination, source, mode, nil)
+}
+
+func writeNewFileValidated(destination string, source io.Reader, mode os.FileMode, validate func(int64) error) (string, int64, error) {
 	if err := os.MkdirAll(filepath.Dir(destination), defaultFolderMode); err != nil {
 		return "", 0, err
 	}
@@ -932,6 +1015,11 @@ func writeNewFile(destination string, source io.Reader, mode os.FileMode) (strin
 	// Only filename selection and commit are serialized; streaming stays concurrent.
 	fileCommitMu.Lock()
 	defer fileCommitMu.Unlock()
+	if validate != nil {
+		if err := validate(size); err != nil {
+			return "", 0, err
+		}
+	}
 	destination, err = chooseAvailablePath(destination)
 	if err != nil {
 		return "", 0, err
@@ -973,20 +1061,20 @@ func processVolumeArchives(downloaded []string, root string) archiveReport {
 	report := archiveReport{found: len(groups)}
 	for _, group := range groups {
 		if len(group.parts) == 1 {
-			fmt.Printf("解压压缩包：%s\n", group.basePath)
+			logf("解压压缩包：%s\n", group.basePath)
 		} else {
-			fmt.Printf("处理分卷压缩包：%s（%d 个分卷）\n", group.basePath, len(group.parts))
+			logf("处理分卷压缩包：%s（%d 个分卷）\n", group.basePath, len(group.parts))
 		}
 		extractedFiles, err := extractVolumeGroup(group, root)
-		report.files = append(report.files, extractedFiles...)
-		report.extracted += len(extractedFiles)
 		if err != nil {
 			report.failures++
-			fmt.Printf("  失败：%v\n", err)
+			logf("  失败：%v\n", err)
 			continue
 		}
+		report.files = append(report.files, extractedFiles...)
+		report.extracted += len(extractedFiles)
 		report.completed++
-		fmt.Printf("  完成：输出 %d 个文件。\n", len(extractedFiles))
+		logf("  完成：输出 %d 个文件。\n", len(extractedFiles))
 	}
 	return report
 }
@@ -1235,44 +1323,7 @@ func decompressedPath(basePath, suffix string) string {
 }
 
 func extractTar(reader io.Reader, destinationDir, root string) ([]string, error) {
-	tarReader := tar.NewReader(reader)
-	extracted := make([]string, 0)
-	for {
-		header, err := tarReader.Next()
-		if errors.Is(err, io.EOF) {
-			return extracted, nil
-		}
-		if err != nil {
-			return extracted, fmt.Errorf("read tar stream: %w", err)
-		}
-		if header.Name == "" {
-			continue
-		}
-		target, err := safeArchivePath(destinationDir, root, header.Name)
-		if err != nil {
-			return extracted, fmt.Errorf("unsafe archive entry %q: %w", header.Name, err)
-		}
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, defaultFolderMode); err != nil {
-				return extracted, fmt.Errorf("create directory %q: %w", target, err)
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), defaultFolderMode); err != nil {
-				return extracted, fmt.Errorf("create output directory: %w", err)
-			}
-			savedPath, _, err := writeNewFile(target, tarReader, defaultFileMode)
-			if err != nil {
-				return extracted, fmt.Errorf("extract %q: %w", header.Name, err)
-			}
-			extracted = append(extracted, savedPath)
-		default:
-			// Symlinks, hard links, device files, and other special entries are not
-			// materialized. This prevents an archive from redirecting later writes.
-			fmt.Printf("  跳过非普通归档项：%s\n", header.Name)
-		}
-	}
+	return extractTarTransaction(reader, destinationDir, root)
 }
 
 // displayFileHashes prints compatibility and integrity hashes for exactly the
@@ -1284,15 +1335,15 @@ func displayFileHashes(root string, paths []string) {
 		fmt.Println("没有可计算哈希的文件。")
 		return
 	}
-	fmt.Printf("正在计算 %d 个文件的 MD5、SHA-1、SHA-256：\n", len(paths))
+	logf("正在计算 %d 个文件的 MD5、SHA-1、SHA-256：\n", len(paths))
 	for _, path := range paths {
 		displayPath := hashDisplayPath(root, path)
 		values, err := calculateFileHashes(path)
 		if err != nil {
-			fmt.Printf("- %s\n  哈希失败：%v\n", displayPath, err)
+			logf("- %s\n  哈希失败：%v\n", displayPath, err)
 			continue
 		}
-		fmt.Printf("- %s（%d 字节）\n  MD5: %s\n  SHA-1: %s\n  SHA-256: %s\n", displayPath, values.size, values.md5, values.sha1, values.sha256)
+		logf("- %s（%d 字节）\n  MD5: %s\n  SHA-1: %s\n  SHA-256: %s\n", displayPath, values.size, values.md5, values.sha1, values.sha256)
 	}
 }
 
@@ -1574,7 +1625,7 @@ func printablePath(path string) string {
 	if path == "" {
 		return "/"
 	}
-	return path
+	return terminalText(path)
 }
 
 func compact(data []byte, limit int) string {
@@ -1585,12 +1636,20 @@ func compact(data []byte, limit int) string {
 	return text[:limit] + "…"
 }
 
-func writeText(writer io.Writer, result output) {
+func writeText(writer io.Writer, result output) error {
 	for _, file := range result.Files {
+		value := file.DownloadURL
 		if file.Error != "" {
-			fmt.Fprintf(writer, "%s\tERROR: %s\n", file.Path, file.Error)
-			continue
+			value = "ERROR: " + file.Error
 		}
-		fmt.Fprintf(writer, "%s\t%s\n", file.Path, file.DownloadURL)
+		line := escapeTextField(file.Path) + "\t" + escapeTextField(value) + "\n"
+		n, err := io.WriteString(writer, line)
+		if err != nil {
+			return err
+		}
+		if n != len(line) {
+			return io.ErrShortWrite
+		}
 	}
+	return nil
 }

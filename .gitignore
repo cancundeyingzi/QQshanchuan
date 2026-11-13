@@ -1,0 +1,11 @@
+# 编译产物
+/dist/
+/qqshanchuan
+/qqshanchuan.exe
+/qfile-link
+/qfile-link.exe
+/*.test
+/*.test.exe
+
+# 本地 IDE 配置
+/.idea/
